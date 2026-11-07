@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatierung
+        if: runner.os == 'Linux'
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Unit-Tests
+        run: cargo test --locked
+      - name: Release-Build
+        run: cargo build --release --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Ende-zu-Ende-Test (Spotify und Claude nachgebildet)
+        shell: bash
+        run: python -I tests/e2e/run.py "target/release/klangwerk-dj${{ runner.os == 'Windows' && '.exe' || '' }}"
+
+  installer:
+    name: Installer-Skripte prüfen
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell-Skripte
+        run: |
+          sh -n install.sh
+          shellcheck install.sh scripts/build-release.sh
+      - name: PowerShell-Skript
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors; exit 1 }
