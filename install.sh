@@ -13,7 +13,7 @@ VERSION="${KLANGWERK_VERSION:-}"
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'Fehler: %s\n' "$*" >&2; exit 1; }
-need() { command -v "$1" >/dev/null 2>&1 || fail "Das Programm „$1“ wird benötigt."; }
+need() { command -v "$1" >/dev/null 2>&1 || fail "Das Programm $1 wird benötigt."; }
 
 need curl
 need tar
@@ -31,7 +31,7 @@ case "$os" in
         esac
         ;;
     Darwin) target=macos-universal ;;
-    *) fail "Unbekanntes System „$os“. Für Windows gibt es einen PowerShell-Befehl, siehe https://github.com/$REPO" ;;
+    *) fail "Unbekanntes System: $os. Für Windows gibt es einen PowerShell-Befehl, siehe https://github.com/$REPO" ;;
 esac
 
 if [ -z "$VERSION" ]; then
