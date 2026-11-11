@@ -1,0 +1,21 @@
+# Wöchentliche Sammel-Vorschläge für Rust-Abhängigkeiten und für die in den Workflows
+# festgelegten Actions. Sicherheitsmeldungen (Dependabot alerts) werden getrennt in den
+# Einstellungen des Repos eingeschaltet.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      rust:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
