@@ -139,25 +139,50 @@ impl Spotify {
         Ok(())
     }
 
+    /// Das Token aus der Datei, falls ein anderer Aufruf des Programms es
+    /// inzwischen erneuert hat.
+    fn changed_on_disk(&self, current: &StoredToken) -> Option<StoredToken> {
+        let disk = self.store.load().ok().flatten()?;
+        (disk.access_token != current.access_token || disk.refresh_token != current.refresh_token)
+            .then_some(disk)
+    }
+
     async fn access_token(&self, force_refresh: bool) -> Result<String> {
         let mut guard = self.token.lock().await;
         if guard.is_none() {
             *guard = self.store.load()?;
         }
-        let refresh_token = match guard.as_ref() {
-            None => return Err(Error::NotLoggedIn),
-            Some(t) if force_refresh || t.expires_soon() => Some(t.refresh_token.clone()),
-            Some(_) => None,
-        };
-        if let Some(refresh_token) = refresh_token {
-            let fresh = self.token_endpoint().refresh(&refresh_token).await?;
-            self.store.save(&fresh)?;
-            *guard = Some(fresh);
+        let mut token = guard.as_ref().cloned().ok_or(Error::NotLoggedIn)?;
+        if force_refresh || token.expires_soon() {
+            // Spotify gibt beim Erneuern ein neues Refresh-Token aus, das alte gilt
+            // dann nicht mehr. Hat ein zweiter Aufruf des Programms schon erneuert
+            // (etwa `status` neben dem Autopiloten), steht das gültige Paar in der
+            // Datei. Ohne diesen Blick endete der länger laufende Aufruf mit
+            // „Anmeldung abgelaufen“.
+            let adopted = match self.changed_on_disk(&token) {
+                Some(disk) => {
+                    token = disk;
+                    true
+                }
+                None => false,
+            };
+            if token.expires_soon() || (force_refresh && !adopted) {
+                token = match self.token_endpoint().refresh(&token.refresh_token).await {
+                    Ok(fresh) => {
+                        self.store.save(&fresh)?;
+                        fresh
+                    }
+                    // Der andere Aufruf war um Haaresbreite schneller.
+                    Err(Error::LoginExpired) => match self.changed_on_disk(&token) {
+                        Some(disk) if !disk.expires_soon() => disk,
+                        _ => return Err(Error::LoginExpired),
+                    },
+                    Err(e) => return Err(e),
+                };
+            }
+            *guard = Some(token.clone());
         }
-        guard
-            .as_ref()
-            .map(|t| t.access_token.clone())
-            .ok_or(Error::NotLoggedIn)
+        Ok(token.access_token)
     }
 
     async fn call(
@@ -297,7 +322,48 @@ fn check(reply: Reply) -> Result<Reply> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spotify::auth::{now_secs, random_string};
     use reqwest::header::HeaderMap;
+
+    fn token(access: &str, refresh: &str, expires_at: u64) -> StoredToken {
+        StoredToken {
+            access_token: access.into(),
+            refresh_token: refresh.into(),
+            expires_at,
+            scope: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn adopts_token_renewed_by_another_process() {
+        let dir = std::env::temp_dir().join(format!("kwdj-test-{}", random_string(12)));
+        // Unter dieser Adresse lauscht niemand: Der Test kommt nur durch, wenn
+        // das Token aus der Datei übernommen und nicht selbst erneuert wird.
+        let nowhere = Url::parse("http://127.0.0.1:9/").expect("url");
+        let sp = Spotify::new(
+            reqwest::Client::new(),
+            nowhere.clone(),
+            nowhere,
+            "id".into(),
+            TokenStore::new(&dir),
+        );
+        sp.store_token(token("alt", "r1", 0)).await.expect("save");
+
+        // Ein zweiter Aufruf des Programms erneuert das abgelaufene Token.
+        let other = TokenStore::new(&dir);
+        other
+            .save(&token("neu", "r2", now_secs() + 3600))
+            .expect("save");
+        assert_eq!(sp.access_token(false).await.expect("token"), "neu");
+
+        // Auch nach einem 401 zählt zuerst, was in der Datei steht.
+        other
+            .save(&token("neuer", "r3", now_secs() + 3600))
+            .expect("save");
+        assert_eq!(sp.access_token(true).await.expect("token"), "neuer");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn reply(status: u16, body: &str) -> Reply {
         Reply {

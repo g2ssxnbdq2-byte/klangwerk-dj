@@ -128,7 +128,7 @@ pub async fn wait_for_code(
 
     let from_browser = async {
         match listener {
-            Some(l) => serve_callback(l, &path).await,
+            Some(l) => serve_callback(l, &path, expected_state).await,
             None => std::future::pending::<Result<String>>().await,
         }
     };
@@ -186,8 +186,28 @@ const PAGE_OK: &str = "<!doctype html><meta charset=\"utf-8\"><title>klangwerk-d
 <p style=\"font:16px system-ui;margin:3em\">Anmeldung abgeschlossen. Du kannst dieses Fenster schließen.</p>";
 const PAGE_FAIL: &str = "<!doctype html><meta charset=\"utf-8\"><title>klangwerk-dj</title>\
 <p style=\"font:16px system-ui;margin:3em\">Die Anmeldung wurde nicht abgeschlossen. Details stehen im Terminal.</p>";
+const PAGE_IGNORED: &str = "<!doctype html><meta charset=\"utf-8\"><title>klangwerk-dj</title>\
+<p style=\"font:16px system-ui;margin:3em\">Das ist nicht die Antwort von Spotify. klangwerk-dj wartet weiter auf die Anmeldung.</p>";
 
-async fn serve_callback(listener: TcpListener, path: &str) -> Result<String> {
+/// Ist das die Antwort von Spotify auf *diese* Anmeldung? Dann trägt sie
+/// unseren `state` und entweder `code` oder `error`.
+fn is_spotify_answer(target: &str, expected_state: &str) -> bool {
+    let query = target.split_once('?').map_or("", |(_, q)| q);
+    let (mut state_ok, mut has_result) = (false, false);
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match &*key {
+            "state" => state_ok = value == expected_state,
+            "code" | "error" => has_result |= !value.is_empty(),
+            _ => {}
+        }
+    }
+    state_ok && has_result
+}
+
+/// Wartet auf den Rückruf. Fremde Aufrufe der Adresse (Vorschau des Browsers,
+/// eine andere Webseite, ein Aufruf ohne oder mit falschem `state`) werden
+/// abgewiesen und brechen die Anmeldung nicht ab.
+async fn serve_callback(listener: TcpListener, path: &str, expected_state: &str) -> Result<String> {
     loop {
         let (mut sock, _) = listener
             .accept()
@@ -217,6 +237,11 @@ async fn serve_callback(listener: TcpListener, path: &str) -> Result<String> {
         });
         match target {
             Some(t) if t.split('?').next() == Some(path) => {
+                if !is_spotify_answer(&t, expected_state) {
+                    debug!("Aufruf der Rückruf-Adresse ohne gültige Antwort ignoriert");
+                    let _ = respond(&mut sock, "400 Bad Request", PAGE_IGNORED).await;
+                    continue;
+                }
                 let page = if t.contains("code=") {
                     PAGE_OK
                 } else {
@@ -540,6 +565,50 @@ mod tests {
         stream.read_to_string(&mut answer).await.expect("read");
         assert!(answer.starts_with("HTTP/1.1 200"));
         assert_eq!(waiter.await.expect("join").expect("code"), "c0de");
+    }
+
+    #[tokio::test]
+    async fn local_server_ignores_foreign_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server =
+            tokio::spawn(async move { serve_callback(listener, "/callback", "st4te").await });
+        for (target, status) in [
+            ("/callback", "400"),
+            ("/callback?code=boese&state=falsch", "400"),
+            ("/callback?state=st4te", "400"),
+            ("/favicon.ico", "404"),
+            ("/callback?code=c0de&state=st4te", "200"),
+        ] {
+            let mut stream = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            stream
+                .write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+                .await
+                .expect("write");
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer).await.expect("read");
+            assert!(
+                answer.starts_with(&format!("HTTP/1.1 {status}")),
+                "{target}: {answer}"
+            );
+        }
+        let target = server.await.expect("join").expect("target");
+        assert_eq!(target, "/callback?code=c0de&state=st4te");
+    }
+
+    #[test]
+    fn recognises_spotify_answers() {
+        assert!(is_spotify_answer("/callback?code=c&state=s", "s"));
+        assert!(is_spotify_answer(
+            "/callback?error=access_denied&state=s",
+            "s"
+        ));
+        assert!(!is_spotify_answer("/callback?code=c&state=x", "s"));
+        assert!(!is_spotify_answer("/callback?code=&state=s", "s"));
+        assert!(!is_spotify_answer("/callback?xcode=c&state=s", "s"));
+        assert!(!is_spotify_answer("/callback", "s"));
     }
 
     #[test]

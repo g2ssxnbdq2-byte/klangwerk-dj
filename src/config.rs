@@ -169,12 +169,33 @@ pub fn load_settings(dir: &std::path::Path) -> Result<()> {
 /// Basisadresse aus der Umgebung; endet immer auf `/`, damit `Url::join` Pfade anhängt.
 fn env_base(name: &str, default: &str) -> Result<Url> {
     let raw = non_empty_env(name).unwrap_or_else(|| default.to_string());
+    parse_base(name, &raw)
+}
+
+/// An diese Adressen gehen Anmelde-Token und API-Schlüssel. Deshalb nur
+/// `https`; `http` ist allein für den eigenen Rechner erlaubt (Tests, lokaler Proxy).
+fn parse_base(name: &str, raw: &str) -> Result<Url> {
+    let raw = raw.trim();
     let with_slash = if raw.ends_with('/') {
-        raw
+        raw.to_string()
     } else {
         format!("{raw}/")
     };
-    Url::parse(&with_slash).map_err(|e| Error::Config(format!("{name}: {e}")))
+    let url = Url::parse(&with_slash).map_err(|e| Error::Config(format!("{name}: {e}")))?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if loopback => Ok(url),
+        _ => Err(Error::Config(format!(
+            "{name} muss https verwenden. http ist nur für den eigenen Rechner erlaubt \
+             (127.0.0.1, [::1], localhost)."
+        ))),
+    }
 }
 
 /// Spotify akzeptiert `http` nur für Loopback-Adressen (127.0.0.1, [::1]),
@@ -222,6 +243,30 @@ mod tests {
             u.join("me/player").expect("join").as_str(),
             "https://api.spotify.com/v1/me/player"
         );
+    }
+
+    #[test]
+    fn base_urls_require_https_except_on_loopback() {
+        for ok in [
+            "https://api.example.org/v1",
+            "http://127.0.0.1:9000/v1/",
+            "http://[::1]:9000",
+            "http://localhost:9000/claude",
+        ] {
+            assert!(parse_base("TEST", ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://api.example.org/",
+            "http://192.168.1.10:8080/",
+            "http://127.0.0.1.example.org/",
+            "ftp://127.0.0.1/",
+            "file:///etc/",
+        ] {
+            assert!(
+                matches!(parse_base("TEST", bad), Err(Error::Config(_))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

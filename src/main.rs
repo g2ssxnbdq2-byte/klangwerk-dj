@@ -486,6 +486,7 @@ async fn autopilot(cfg: &Config, http: &reqwest::Client, args: DjArgs) -> anyhow
         spotify: sp,
         engine,
         brief: request.brief.clone(),
+        start_after: request.start_after.clone(),
         batch: request.count.clamp(3, 10),
         lead: Duration::from_secs(args.vorlauf),
         endless: args.endlos,
