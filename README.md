@@ -65,7 +65,9 @@ Die Skripte laden das passende Paket aus dem neuesten
 und installieren ohne Administratorrechte nach `~/.local/bin` bzw.
 `%LOCALAPPDATA%\Programs\klangwerk-dj`. Wer ein Skript vor dem Ausführen lesen möchte:
 [install.sh](install.sh), [install.ps1](install.ps1). Ein erneuter Aufruf aktualisiert auf die
-neueste Version.
+neueste Version. Eine bestimmte Version wählt die Umgebungsvariable `KLANGWERK_VERSION`, unter
+Linux und macOS etwa mit `… | KLANGWERK_VERSION=0.1.0 sh`. `install.sh` lädt ausschließlich über
+https, auch nach Weiterleitungen.
 
 | Paket | Läuft auf |
 |---|---|
@@ -147,6 +149,14 @@ Globale Optionen: `--json`, `--modell`, `--aufwand low|medium|high|xhigh|max`, `
 | `KLANGWERK_OHNE_FALLBACK` | aus | Server-seitiges Ausweichmodell bei Ablehnung abschalten |
 | `KLANGWERK_DATEN` | je nach System, siehe oben | Ordner für Token und `einstellungen.env` |
 | `RUST_LOG` | `klangwerk_dj=info,warn` | Protokollstufe (Ausgabe auf stderr) |
+| `SPOTIFY_API_BASE` | `https://api.spotify.com/v1/` | Adresse der Spotify Web API |
+| `SPOTIFY_ACCOUNTS_BASE` | `https://accounts.spotify.com/` | Adresse der Spotify-Anmeldung |
+| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com/` | Adresse der Claude-API |
+
+Die drei Adressen brauchst du im Normalfall nicht zu ändern. Sie müssen https verwenden. http ist
+nur für den eigenen Rechner erlaubt (`127.0.0.1`, `[::1]`, `localhost`), etwa für Tests. Bei jeder
+anderen http-Adresse bricht das Programm beim Start mit einer Fehlermeldung ab, damit Token und
+API-Schlüssel nicht unverschlüsselt durchs Netz gehen.
 
 ## Technik
 
@@ -155,12 +165,22 @@ Globale Optionen: `--json`, `--modell`, `--aufwand low|medium|high|xhigh|max`, `
   einstellbarem Aufwand (`output_config.effort`). Bei Ablehnung springt serverseitig ein
   Ausweichmodell ein (`fallbacks: "default"`, Beta `server-side-fallback-2026-07-01`).
   `stop_reason` wird vor dem Inhalt geprüft (`refusal`, `max_tokens`).
-- **Spotify Web API**: OAuth mit PKCE und automatischer Token-Erneuerung. Suche mit höchstens
-  10 Treffern (Grenze des Development Mode). Ein KI-Vorschlag wird nur eingereiht, wenn Interpret
-  und Titel zu einem Treffer passen.
+- **Spotify Web API**: OAuth mit PKCE und automatischer Token-Erneuerung. Bei der Anmeldung nimmt
+  der lokale Rückruf-Server nur die Antwort mit dem `state` der laufenden Anmeldung an. Vor dem
+  Erneuern wird die Token-Datei neu gelesen, damit sich ein Dienst und ein einzelner Befehl
+  dieselbe Anmeldung teilen können. Suche mit höchstens 10 Treffern (Grenze des Development Mode).
+  Ein KI-Vorschlag wird nur eingereiht, wenn Interpret und Titel zu einem Treffer passen; der
+  Interpret muss dabei in ganzen Wörtern übereinstimmen.
 - **Fehlerbehandlung**: Wiederholungen mit exponentiellem Backoff und `Retry-After` bei
-  408/409/429/5xx/529. Kein erneuter Versuch bei `QUOTA_EXCEEDED`. Einreihen wird bei unklarem
-  Ausgang nicht wiederholt, damit kein Titel doppelt landet.
+  408/409/429/5xx/529. Kein erneuter Versuch bei `QUOTA_EXCEEDED`. Eine KI-Planung wird bei
+  Überlastung höchstens zweimal wiederholt und nach einer Zeitüberschreitung gar nicht, weil jeder
+  Versuch Minuten dauern und Geld kosten kann.
+- **Autopilot bei Störungen**: Weist Spotify das Einreihen ab (etwa weil kurz kein Gerät aktiv
+  ist), folgt der nächste Versuch nach 3 Sekunden, bei anhaltender Abweisung nach 6, 12 und
+  24 Sekunden. Bleibt der Ausgang offen (Zeitüberschreitung oder Serverfehler), gibt es während des
+  laufenden Titels keinen zweiten Versuch, damit kein Titel doppelt landet: Beginnt der Titel zu
+  laufen, gilt er als angekommen, sonst wird er beim nächsten Titel erneut eingereiht. Schlägt mit
+  `--endlos` das Nachplanen fehl, wächst die Pause von 2 über 4, 8 und 16 auf höchstens 30 Minuten.
 
 ## Als Dienst laufen lassen (Linux, optional)
 
@@ -184,8 +204,16 @@ Die Zugangsdaten kommen aus `einstellungen.env`. Danach:
 Ein Tag `v<version>` (passend zu `Cargo.toml`) startet `.github/workflows/release.yml`. Der
 Workflow baut auf echten Linux-, Windows- und macOS-Rechnern und legt das Release mit allen Paketen
 und `SHA256SUMS` an. Unter Windows wird mit statischer C-Laufzeit und Control Flow Guard gebaut,
-unter macOS als Universal-Binary mit Ad-hoc-Signatur. Jeder Push durchläuft vorher die CI auf
-allen drei Systemen, mit Clippy, Unit-Tests und dem Ende-zu-Ende-Test in `tests/e2e/`.
+unter macOS als Universal-Binary mit Ad-hoc-Signatur.
+
+Veröffentlicht wird nur, wenn die komplette CI für denselben Stand grün ist: Clippy, Unit-Tests
+und der Ende-zu-Ende-Test in `tests/e2e/` auf allen drei Systemen. Dieselbe CI läuft bei jedem
+Push. Schreibrechte auf das Repository hat allein der veröffentlichende Job. Fremde Actions sind
+auf Commits festgelegt, und Dependabot schlägt wöchentlich Aktualisierungen für Actions und
+Abhängigkeiten vor.
+
+Vor dem Tag die Version in `Cargo.toml` anheben und in [CHANGELOG.md](CHANGELOG.md) den Abschnitt
+„Unveröffentlicht“ mit Versionsnummer und Datum überschreiben:
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
@@ -206,7 +234,13 @@ cargo build --release && python3 -I tests/e2e/run.py target/release/klangwerk-dj
 
 Der Ende-zu-Ende-Test startet einen nachgebildeten Spotify- und Claude-Server (`tests/e2e/mock.py`)
 und prüft unter anderem Anmeldung mit PKCE, Wiederholung bei Überlastung, die Reihenfolge im
-Autopiloten und dass keine Spotify-Daten an die KI gehen.
+Autopiloten, gestörtes Einreihen und dass keine Spotify-Daten an die KI gehen.
+
+## Sicherheit und Änderungen
+
+Schwachstellen bitte nicht als öffentliches Issue melden, sondern vertraulich. Der Weg dafür steht
+in [SECURITY.md](SECURITY.md), zusammen mit dem, was das Programm schützt, und den bekannten
+Grenzen. Was sich zwischen den Versionen geändert hat, steht in [CHANGELOG.md](CHANGELOG.md).
 
 ## Lizenz
 
