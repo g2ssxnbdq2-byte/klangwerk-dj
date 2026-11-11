@@ -14,6 +14,8 @@ VERSION="${KLANGWERK_VERSION:-}"
 say() { printf '%s\n' "$*"; }
 fail() { printf 'Fehler: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || fail "Das Programm $1 wird benötigt."; }
+# Lädt nur über https (auch nach Weiterleitungen) und mindestens mit TLS 1.2.
+fetch() { curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "$@"; }
 
 need curl
 need tar
@@ -35,11 +37,15 @@ case "$os" in
 esac
 
 if [ -z "$VERSION" ]; then
-    latest=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest") \
+    latest=$(fetch -I -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest") \
         || fail "Die neueste Version ließ sich nicht ermitteln."
     VERSION=${latest##*/tag/v}
     [ "$VERSION" != "$latest" ] || fail "Es gibt noch keine veröffentlichte Version."
 fi
+# Die Version landet in Adressen und Dateinamen, deshalb sind nur unverfängliche Zeichen erlaubt.
+case "$VERSION" in
+    *[!0-9A-Za-z.+-]*) fail "Ungültige Versionsangabe: $VERSION" ;;
+esac
 
 asset="$BIN-$VERSION-$target.tar.gz"
 base="https://github.com/$REPO/releases/download/v$VERSION"
@@ -47,8 +53,8 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "Lade $asset …"
-curl -fsSL -o "$tmp/$asset" "$base/$asset" || fail "Download fehlgeschlagen: $base/$asset"
-curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" || fail "Prüfsummen ließen sich nicht laden."
+fetch -o "$tmp/$asset" "$base/$asset" || fail "Download fehlgeschlagen: $base/$asset"
+fetch -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" || fail "Prüfsummen ließen sich nicht laden."
 
 expected=$(awk -v f="$asset" '{ n = $2; sub(/^\*/, "", n); sub(/^\.\//, "", n); if (n == f) print $1 }' "$tmp/SHA256SUMS")
 [ -n "$expected" ] || fail "Keine Prüfsumme für $asset gefunden."

@@ -21,6 +21,9 @@ if (-not $version) {
         -Uri "https://api.github.com/repos/$repo/releases/latest"
     $version = $release.tag_name.TrimStart('v')
 }
+if ($version -notmatch '\A[0-9A-Za-z.+-]+\z') {
+    throw "Ungueltige Versionsangabe: $version"
+}
 
 $name = "$bin-$version-windows-x86_64"
 $asset = "$name.zip"
