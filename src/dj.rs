@@ -97,10 +97,31 @@ fn announce(prefix: &str, r: &Resolved) {
     println!("   ↳ {}", s.transition);
 }
 
+/// Pause nach erfolglosem Nachplanen: 2, 4, 8, 16, dann höchstens 30 Minuten.
+/// Jeder Versuch kann eine KI-Anfrage kosten, ein Dauerfehler soll das nicht
+/// alle zwei Minuten tun.
+fn refill_pause(failures: u32) -> Duration {
+    let factor = 1u64 << failures.saturating_sub(1).min(4);
+    Duration::from_secs((120 * factor).min(1800))
+}
+
+/// Pause nach abgewiesenem Einreihen: 3, 6, 12, dann 24 Sekunden. Der zweite
+/// Versuch kommt schnell genug für den laufenden Titel, eine anhaltende
+/// Abweisung löst trotzdem keine Anfrage im Drei-Sekunden-Takt aus.
+fn enqueue_pause(rejections: u32) -> Duration {
+    Duration::from_secs(3u64 << rejections.saturating_sub(1).min(3))
+}
+
+fn front_uri(queue: &VecDeque<Resolved>) -> Option<&str> {
+    queue.front()?.track.as_ref().map(|t| t.uri.as_str())
+}
+
 pub struct Autopilot<E: Engine + 'static> {
     pub spotify: Arc<Spotify>,
     pub engine: Arc<E>,
     pub brief: String,
+    /// Titel, an den der erste Plan anschließen sollte (`--ab`).
+    pub start_after: Option<String>,
     pub batch: usize,
     pub lead: Duration,
     pub endless: bool,
@@ -123,6 +144,14 @@ impl<E: Engine + 'static> Autopilot<E> {
             });
         }
         let device = self.device.as_deref();
+        // Woran die nächste Planung anschließt: der letzte Vorschlag, der wirklich
+        // gespielt wird. Vorschläge ohne Spotify-Treffer zählen nicht, sonst plante
+        // die KI den Übergang von einem Titel aus, der nie läuft. Es bleibt bei der
+        // Schreibweise der KI; Spotify-Daten gehen nicht an sie zurück.
+        let mut anchor: Option<String> = queue
+            .back()
+            .map(|r| r.suggestion.label())
+            .or_else(|| self.start_after.clone());
 
         if start {
             let playing =
@@ -142,8 +171,13 @@ impl<E: Engine + 'static> Autopilot<E> {
 
         println!("\nAutopilot läuft. Strg+C beendet ihn; die Wiedergabe in Spotify läuft weiter.");
         let mut queued_during: Option<String> = None;
+        // Ein Einreihen mit offenem Ausgang (Zeitüberschreitung, 5xx): Der Titel
+        // bleibt vorn im Plan, bis sich zeigt, ob Spotify ihn angenommen hat.
+        let mut unconfirmed = false;
+        let mut enqueue_rejections: u32 = 0;
         let mut refill: Option<JoinHandle<Result<Vec<Resolved>>>> = None;
         let mut refill_pause_until: Option<Instant> = None;
+        let mut refill_failures: u32 = 0;
         let mut idle = Duration::from_secs(5);
 
         loop {
@@ -152,34 +186,45 @@ impl<E: Engine + 'static> Autopilot<E> {
                 && queue.len() <= 2
                 && refill_pause_until.map_or(true, |t| Instant::now() >= t)
             {
-                refill = Some(self.spawn_refill(&history));
+                refill = Some(self.spawn_refill(&history, anchor.clone()));
             }
             if refill.as_ref().is_some_and(|h| h.is_finished()) {
                 if let Some(handle) = refill.take() {
-                    match handle.await {
+                    let planned = match handle.await {
                         Ok(Ok(batch)) => {
-                            let found = batch.iter().filter(|r| r.track.is_some()).count();
+                            let mut found = 0usize;
                             for r in batch {
-                                history.push(r.suggestion.label());
+                                let label = r.suggestion.label();
+                                history.push(label.clone());
                                 if r.track.is_some() {
+                                    anchor = Some(label);
+                                    found += 1;
                                     queue.push_back(r);
                                 }
                             }
                             info!("{found} weitere Titel geplant");
-                            if found == 0 {
-                                refill_pause_until =
-                                    Some(Instant::now() + Duration::from_secs(120));
-                            }
+                            found > 0
                         }
                         Ok(Err(e)) if e.is_fatal() => return Err(e),
                         Ok(Err(e)) => {
                             warn!("Nachplanen fehlgeschlagen: {e}");
-                            refill_pause_until = Some(Instant::now() + Duration::from_secs(120));
+                            false
                         }
                         Err(e) => {
                             warn!("Nachplanen abgebrochen: {e}");
-                            refill_pause_until = Some(Instant::now() + Duration::from_secs(120));
+                            false
                         }
+                    };
+                    if planned {
+                        refill_failures = 0;
+                    } else {
+                        refill_failures = refill_failures.saturating_add(1);
+                        let pause = refill_pause(refill_failures);
+                        warn!(
+                            "Kein neuer Titel geplant, nächster Versuch in {} Minuten",
+                            pause.as_secs() / 60
+                        );
+                        refill_pause_until = Some(Instant::now() + pause);
                     }
                 }
             }
@@ -196,8 +241,17 @@ impl<E: Engine + 'static> Autopilot<E> {
                     ..
                 })) => {
                     idle = Duration::from_secs(5);
+                    if unconfirmed && front_uri(&queue) == Some(track.uri.as_str()) {
+                        // Der Titel läuft: Das Einreihen mit offenem Ausgang ist doch
+                        // angekommen. Ein zweiter Versuch würde ihn doppelt spielen.
+                        if let Some(arrived) = queue.pop_front() {
+                            announce("Läuft jetzt", &arrived);
+                        }
+                        unconfirmed = false;
+                    }
                     let remaining = track.duration_ms.saturating_sub(progress_ms.unwrap_or(0));
                     let lead = u64::try_from(self.lead.as_millis()).unwrap_or(u64::MAX);
+                    let mut retry_soon = false;
                     let wait = if remaining <= lead {
                         if queued_during.as_deref() != Some(track.uri.as_str()) {
                             if let Some(next) = queue.pop_front() {
@@ -210,16 +264,36 @@ impl<E: Engine + 'static> Autopilot<E> {
                                     Ok(()) => {
                                         announce("Als Nächstes", &next);
                                         queued_during = Some(track.uri.clone());
+                                        unconfirmed = false;
+                                        enqueue_rejections = 0;
                                     }
                                     Err(e) if e.is_fatal() => return Err(e),
                                     Err(e) => {
                                         warn!("Einreihen fehlgeschlagen: {e}");
+                                        if e.not_processed() {
+                                            // Sicher nicht angekommen: gleich noch einmal,
+                                            // solange der laufende Titel nicht zu Ende ist.
+                                            enqueue_rejections =
+                                                enqueue_rejections.saturating_add(1);
+                                            retry_soon = true;
+                                        } else {
+                                            // Ausgang offen: während dieses Titels kein
+                                            // zweiter Versuch. Läuft danach etwas anderes,
+                                            // wird der Titel dort erneut eingereiht.
+                                            unconfirmed = true;
+                                            queued_during = Some(track.uri.clone());
+                                            enqueue_rejections = 0;
+                                        }
                                         queue.push_front(next);
                                     }
                                 }
                             }
                         }
-                        Duration::from_millis(remaining + 1500)
+                        if retry_soon {
+                            enqueue_pause(enqueue_rejections)
+                        } else {
+                            Duration::from_millis(remaining + 1500)
+                        }
                     } else {
                         Duration::from_millis(remaining - lead)
                     };
@@ -247,13 +321,17 @@ impl<E: Engine + 'static> Autopilot<E> {
         }
     }
 
-    fn spawn_refill(&self, history: &[String]) -> JoinHandle<Result<Vec<Resolved>>> {
+    fn spawn_refill(
+        &self,
+        history: &[String],
+        start_after: Option<String>,
+    ) -> JoinHandle<Result<Vec<Resolved>>> {
         let spotify = Arc::clone(&self.spotify);
         let engine = Arc::clone(&self.engine);
         let request = PlanRequest {
             brief: self.brief.clone(),
             count: self.batch,
-            start_after: history.last().cloned(),
+            start_after,
             avoid: history.to_vec(),
         };
         info!("Plane weitere Titel …");
@@ -261,5 +339,26 @@ impl<E: Engine + 'static> Autopilot<E> {
             let plan = engine.plan(&request).await?;
             resolve_all(&spotify, &plan).await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refill_pause_doubles_up_to_half_an_hour() {
+        let minutes: Vec<u64> = (1..=7).map(|n| refill_pause(n).as_secs() / 60).collect();
+        assert_eq!(minutes, [2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(refill_pause(0), Duration::from_secs(120));
+        assert_eq!(refill_pause(u32::MAX), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn enqueue_pause_starts_short_and_stays_below_the_poll_limit() {
+        let seconds: Vec<u64> = (1..=6).map(|n| enqueue_pause(n).as_secs()).collect();
+        assert_eq!(seconds, [3, 6, 12, 24, 24, 24]);
+        assert_eq!(enqueue_pause(0), Duration::from_secs(3));
+        assert_eq!(enqueue_pause(u32::MAX), Duration::from_secs(24));
     }
 }

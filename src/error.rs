@@ -82,6 +82,18 @@ impl Error {
         )
     }
 
+    /// Die Anfrage wurde sicher nicht verarbeitet: Sie kam gar nicht an oder
+    /// wurde abgewiesen. Dann darf auch ein nicht wiederholbarer Aufruf (Einreihen)
+    /// gleich noch einmal versucht werden, ohne dass etwas doppelt landet.
+    pub fn not_processed(&self) -> bool {
+        match self {
+            Error::NoActiveDevice => true,
+            Error::Api { status, .. } => (400..500).contains(status),
+            Error::Network { source, .. } => source.is_connect(),
+            _ => false,
+        }
+    }
+
     pub fn io(path: &std::path::Path, source: std::io::Error) -> Self {
         Error::Io {
             path: path.display().to_string(),
@@ -91,3 +103,27 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api(status: u16) -> Error {
+        Error::Api {
+            service: "Test",
+            status,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_rejected_requests_count_as_not_processed() {
+        assert!(Error::NoActiveDevice.not_processed());
+        assert!(api(404).not_processed());
+        assert!(api(429).not_processed());
+        // Bei 5xx ist offen, ob der Dienst die Anfrage noch ausgeführt hat.
+        assert!(!api(500).not_processed());
+        assert!(!api(502).not_processed());
+        assert!(!Error::Truncated.not_processed());
+    }
+}

@@ -58,6 +58,11 @@ def entries():
         return [json.loads(line) for line in f]
 
 
+def mock_get(path):
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}") as f:
+        return f.read()
+
+
 for _ in range(50):
     try:
         socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
@@ -121,6 +126,26 @@ try:
     check("dj: Reihenfolge eingehalten",
           queued == ["spotify:track:norah", "spotify:track:bill", "spotify:track:daft"], queued)
     check("dj: beendet sich nach dem letzten Titel", "Autopilot beendet" in r.stdout, r.stdout)
+
+    # 4b) Autopilot bei Störungen: Eine Abweisung (404) wird noch im laufenden Titel wiederholt.
+    #     Meldet Spotify einen Fehler (502), reiht den Titel aber trotzdem ein, landet er nicht doppelt.
+    mock_get("/mock/queue-faults?f=404,502x")
+    before = len(entries())
+    queued_before = len(json.loads(mock_get("/mock/state"))["queued"])
+    r = run(["dj", "Testwunsch", "-n", "4", "--vorlauf", "20"], timeout=120)
+    posts = [e for e in entries()[before:]
+             if e.get("path") == "/v1/me/player/queue" and e.get("method") == "POST"]
+    tried = [e["query"].get("uri") for e in posts]
+    arrived = json.loads(mock_get("/mock/state"))["queued"][queued_before:]
+    check("dj mit Störungen: Exit 0", r.returncode == 0, r.stderr)
+    check("dj mit Störungen: abgewiesener Titel erneut versucht, unklarer nicht",
+          tried == ["spotify:track:norah", "spotify:track:norah", "spotify:track:bill", "spotify:track:daft"],
+          tried)
+    check("dj mit Störungen: jeder Titel genau einmal eingereiht",
+          arrived == ["spotify:track:norah", "spotify:track:bill", "spotify:track:daft"], arrived)
+    check("dj mit Störungen: neuer Versuch noch im laufenden Titel",
+          len(posts) >= 2 and posts[1]["t"] - posts[0]["t"] < 10,
+          [round(e["t"] - posts[0]["t"], 1) for e in posts])
 
     # 5) Kein Spotify-Inhalt an die KI (Spotify-URIs, laufender Titel, Spotify-Schreibweise, Tokens)
     markers = ["spotify:track", "Laufender Titel", "Irgendwer", "(feat. Pharrell", "AT1", "AT2"]

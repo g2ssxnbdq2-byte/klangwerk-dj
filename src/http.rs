@@ -15,6 +15,10 @@ pub struct RetryPolicy {
     pub max_attempts: u32,
     pub base_delay: Duration,
     pub max_delay: Duration,
+    /// Auch nach einer Zeitüberschreitung neu versuchen. Bei langen, teuren
+    /// Anfragen (KI-Plan) besser `false`: Sonst wartet man ein Vielfaches der
+    /// Frist und zahlt womöglich mehrfach.
+    pub retry_timeouts: bool,
 }
 
 impl Default for RetryPolicy {
@@ -23,6 +27,7 @@ impl Default for RetryPolicy {
             max_attempts: 4,
             base_delay: Duration::from_millis(800),
             max_delay: Duration::from_secs(60),
+            retry_timeouts: true,
         }
     }
 }
@@ -58,7 +63,12 @@ pub fn retryable_status(status: StatusCode) -> bool {
 pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
     let secs: f64 = raw.parse().ok()?;
-    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
+    if secs.is_nan() || secs < 0.0 {
+        return None;
+    }
+    // `Duration::from_secs_f64` bricht bei übergroßen Werten (etwa `1e20`) mit
+    // einer Panik ab. Solche Werte zählen als „länger als jede Obergrenze“.
+    Some(Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX))
 }
 
 pub fn backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
@@ -126,7 +136,10 @@ where
                         delay
                     }
                     Err(e) => {
-                        if !idempotent || attempt >= policy.max_attempts {
+                        let give_up = !idempotent
+                            || attempt >= policy.max_attempts
+                            || (e.is_timeout() && !policy.retry_timeouts);
+                        if give_up {
                             return Err(Error::Network { service, source: e });
                         }
                         let delay = backoff(policy, attempt);
@@ -136,8 +149,15 @@ where
                 }
             }
             Err(e) => {
-                let transient =
-                    e.is_connect() || (idempotent && (e.is_timeout() || e.is_request()));
+                // Scheitert schon der Verbindungsaufbau, hat der Server nichts
+                // verarbeitet; das darf immer wiederholt werden.
+                let transient = if e.is_connect() {
+                    true
+                } else if e.is_timeout() {
+                    idempotent && policy.retry_timeouts
+                } else {
+                    idempotent && e.is_request()
+                };
                 if !transient || attempt >= policy.max_attempts {
                     return Err(Error::Network { service, source: e });
                 }
@@ -191,7 +211,24 @@ mod tests {
             max_attempts: 3,
             base_delay: Duration::from_millis(5),
             max_delay: Duration::from_secs(2),
+            retry_timeouts: true,
         }
+    }
+
+    /// Server, der Verbindungen annimmt und nie antwortet.
+    async fn hanging() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                open.push(sock);
+            }
+        });
+        (format!("http://{addr}/"), hits)
     }
 
     #[tokio::test]
@@ -252,11 +289,64 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_survives_absurd_values() {
+        let mut h = HeaderMap::new();
+        for raw in ["1e20", "99999999999999999999999", "inf"] {
+            h.insert(RETRY_AFTER, raw.parse().expect("header"));
+            assert_eq!(retry_after(&h), Some(Duration::MAX), "{raw}");
+        }
+        for raw in ["NaN", "-0.5", "bald"] {
+            h.insert(RETRY_AFTER, raw.parse().expect("header"));
+            assert_eq!(retry_after(&h), None, "{raw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn absurd_retry_after_ends_without_retry() {
+        let (url, hits) = mock(vec![
+            response("429 Too Many Requests", "retry-after: 1e20\r\n", "{}"),
+            response("200 OK", "", "{}"),
+        ])
+        .await;
+        let client = reqwest::Client::new();
+        let reply = send_with_retry("Test", &fast(), true, || client.get(&url))
+            .await
+            .expect("reply");
+        assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn timeout_is_retried_only_if_the_policy_allows_it() {
+        let client = reqwest::Client::new();
+        let short = Duration::from_millis(300);
+
+        let (url, hits) = hanging().await;
+        let once = RetryPolicy {
+            retry_timeouts: false,
+            ..fast()
+        };
+        let err = send_with_retry("Test", &once, true, || client.get(&url).timeout(short))
+            .await
+            .expect_err("Zeitüberschreitung");
+        assert!(matches!(err, Error::Network { .. }));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let (url, hits) = hanging().await;
+        let err = send_with_retry("Test", &fast(), true, || client.get(&url).timeout(short))
+            .await
+            .expect_err("Zeitüberschreitung");
+        assert!(matches!(err, Error::Network { .. }));
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
     fn backoff_grows_and_is_capped() {
         let p = RetryPolicy {
             max_attempts: 10,
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_millis(500),
+            retry_timeouts: true,
         };
         assert!(backoff(&p, 1) >= Duration::from_millis(100));
         assert!(backoff(&p, 2) >= Duration::from_millis(200));

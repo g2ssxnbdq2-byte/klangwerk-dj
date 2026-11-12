@@ -182,7 +182,14 @@ impl Claude {
             model,
             effort,
             fallbacks,
-            retry: RetryPolicy::default(),
+            // Ein Plan kann Minuten dauern und kostet Geld. Überlastung (429, 5xx,
+            // 529) wird deshalb höchstens zweimal wiederholt, eine abgelaufene
+            // Frist gar nicht: Die Anfrage lief dann womöglich schon voll durch.
+            retry: RetryPolicy {
+                max_attempts: 3,
+                retry_timeouts: false,
+                ..RetryPolicy::default()
+            },
         })
     }
 

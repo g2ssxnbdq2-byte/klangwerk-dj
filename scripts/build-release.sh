@@ -1,5 +1,8 @@
 #!/bin/sh
 # Baut Release-Pakete für Linux, Windows und macOS von einem Linux-Rechner aus.
+# Gedacht zum Ausprobieren ohne GitHub. Die veröffentlichten Pakete baut
+# .github/workflows/release.yml auf echten Rechnern; sie enthalten zusätzlich die ARM-Pakete für
+# Linux, und das Windows-Paket entsteht dort mit MSVC statt wie hier mit MinGW (gnu).
 # Voraussetzungen: rustup, zig 0.14 und cargo-zigbuild im PATH sowie die Rust-Ziele
 #   rustup target add x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin
 set -eu
@@ -25,7 +28,7 @@ build universal2-apple-darwin
 pack_tar() {  # Zielname, Binärdatei
     tmp="$DIST/klangwerk-dj-$VERSION-$1"
     mkdir -p "$tmp"
-    cp "$2" README.md "$tmp/"
+    cp "$2" README.md LICENSE "$tmp/"
     tar -C "$DIST" -czf "$tmp.tar.gz" "klangwerk-dj-$VERSION-$1"
     rm -rf "$tmp"
 }
@@ -35,7 +38,7 @@ pack_tar macos-universal target/universal2-apple-darwin/release/klangwerk-dj
 
 win="$DIST/klangwerk-dj-$VERSION-windows-x86_64"
 mkdir -p "$win"
-cp target/x86_64-pc-windows-gnu/release/klangwerk-dj.exe README.md "$win/"
+cp target/x86_64-pc-windows-gnu/release/klangwerk-dj.exe README.md LICENSE "$win/"
 (cd "$DIST" && zip -qr "klangwerk-dj-$VERSION-windows-x86_64.zip" "klangwerk-dj-$VERSION-windows-x86_64")
 rm -rf "$win"
 

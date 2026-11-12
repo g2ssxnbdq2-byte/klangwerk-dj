@@ -5,7 +5,14 @@ use std::collections::HashSet;
 
 use crate::spotify::Track;
 
+fn words(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+}
+
 /// Kleinschreibung, ohne Klammerzusätze, ohne „ - Remastered …“, ohne „feat. …“.
+/// Besteht ein Name nur aus einem solchen Zusatz – etwa „(Nice Dream)“ –,
+/// bleibt der ganze Text erhalten.
 pub fn normalize(s: &str) -> String {
     let lower = s.to_lowercase();
     let mut kept = String::with_capacity(lower.len());
@@ -24,15 +31,15 @@ pub fn normalize(s: &str) -> String {
         .filter(|&i| i > 0)
         .min()
         .map_or(kept.as_str(), |i| &kept[..i]);
-    let spaced: String = base
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect();
-    spaced
-        .split_whitespace()
+    let core = words(base)
         .take_while(|t| !matches!(*t, "feat" | "ft" | "featuring"))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    if core.is_empty() {
+        words(&lower).collect::<Vec<_>>().join(" ")
+    } else {
+        core
+    }
 }
 
 /// Jaccard-Ähnlichkeit der Wortmengen zweier normalisierter Texte.
@@ -50,13 +57,21 @@ pub fn similarity(a: &str, b: &str) -> f64 {
     common / all
 }
 
+/// `needle` steht als zusammenhängende Wortfolge in `haystack`: „beatles“ in
+/// „the beatles“, aber nicht „daf“ in „daft punk“.
+fn contains_words(haystack: &str, needle: &str) -> bool {
+    let hay: Vec<&str> = haystack.split(' ').collect();
+    let need: Vec<&str> = needle.split(' ').collect();
+    hay.windows(need.len()).any(|w| w == need.as_slice())
+}
+
 fn artist_matches(wanted: &str, candidate: &str) -> bool {
     let n = normalize(candidate);
     !n.is_empty()
         && (n == wanted
             || similarity(&n, wanted) >= 0.5
-            || wanted.contains(&n)
-            || n.contains(wanted))
+            || contains_words(wanted, &n)
+            || contains_words(&n, wanted))
 }
 
 pub fn best_match<'a>(artist: &str, title: &str, candidates: &'a [Track]) -> Option<&'a Track> {
@@ -108,6 +123,27 @@ mod tests {
         assert_eq!(normalize("Song ft. Somebody"), "song");
         assert_eq!(normalize("Leftovers"), "leftovers");
         assert_eq!(normalize("Für Elise"), "für elise");
+    }
+
+    #[test]
+    fn keeps_names_that_consist_only_of_an_addition() {
+        assert_eq!(normalize("(Nice Dream)"), "nice dream");
+        assert_eq!(normalize("[Untitled]"), "untitled");
+        let found = vec![track("Radiohead", "(Nice Dream)")];
+        assert!(best_match("Radiohead", "(Nice Dream)", &found).is_some());
+    }
+
+    #[test]
+    fn artist_must_match_whole_words() {
+        let found = vec![track("Daft Punk", "One More Time")];
+        assert!(best_match("Daf", "One More Time", &found).is_none());
+        assert!(best_match("Daft Punk", "One More Time", &found).is_some());
+        // Ein Interpret namens „A“ steckt als Buchstabe in fast jedem Namen.
+        let found = vec![track("A", "Hey Jude")];
+        assert!(best_match("The Beatles", "Hey Jude", &found).is_none());
+        // Nennt die KI zwei Interpreten, genügt einer davon.
+        let found = vec![track("Daft Punk", "Get Lucky")];
+        assert!(best_match("Daft Punk, Pharrell Williams", "Get Lucky", &found).is_some());
     }
 
     #[test]

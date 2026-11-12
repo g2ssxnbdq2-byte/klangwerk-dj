@@ -6,12 +6,14 @@ import base64
 import hashlib
 import json
 import sys
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1])
 LOG = sys.argv[2]
-STATE = {"authorize": None, "now_calls": 0, "queued": [], "claude_calls": 0}
+STATE = {"authorize": None, "now_calls": 0, "queued": [], "claude_calls": 0,
+         "queue_faults": [], "hold": 0, "play_next": None}
 
 PLAN = {
     "session_name": "Testabend",
@@ -40,7 +42,7 @@ CATALOG = {
 
 def log(entry):
     with open(LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.write(json.dumps(dict(entry, t=time.time()), ensure_ascii=False) + "\n")
 
 
 class H(BaseHTTPRequestHandler):
@@ -91,6 +93,13 @@ class H(BaseHTTPRequestHandler):
         if url.path == "/mock/challenge":
             STATE["challenge"] = q.get("c")
             return self.send(204)
+        if url.path == "/mock/queue-faults":
+            # Störungen für die nächsten Einreih-Aufrufe, der Reihe nach:
+            # "404" = abgewiesen, "502x" = Fehler gemeldet, aber trotzdem eingereiht.
+            STATE["queue_faults"] = [f for f in q.get("f", "").split(",") if f]
+            return self.send(204)
+        if url.path == "/mock/state":
+            return self.send(200, STATE)
 
         # ---- Claude
         if url.path == "/claude/v1/messages":
@@ -113,13 +122,32 @@ class H(BaseHTTPRequestHandler):
             hits = [t for k, t in CATALOG.items() if k in text]
             return self.send(200, {"tracks": {"items": hits}})
         if url.path == "/v1/me/player/currently-playing":
-            STATE["now_calls"] += 1
+            if STATE["play_next"]:
+                # Der trotz Fehlermeldung eingereihte Titel läuft jetzt.
+                item = next(t for t in CATALOG.values() if t["uri"] == STATE["play_next"])
+                STATE["play_next"] = None
+                return self.send(200, {"is_playing": True, "progress_ms": item["duration_ms"] - 4000,
+                                       "currently_playing_type": "track", "item": item})
+            if STATE["hold"]:
+                STATE["hold"] -= 1  # derselbe Titel läuft noch
+            else:
+                STATE["now_calls"] += 1
             n = STATE["now_calls"]
-            return self.send(200, {"is_playing": True, "progress_ms": 176000, "currently_playing_type": "track",
+            # Steht eine Abweisung an, bleibt genug Restzeit für einen zweiten Versuch im selben Titel.
+            progress = 165000 if STATE["queue_faults"][:1] == ["404"] else 176000
+            return self.send(200, {"is_playing": True, "progress_ms": progress, "currently_playing_type": "track",
                                    "item": {"uri": f"spotify:track:laeuft{n}", "name": f"Laufender Titel {n}",
                                             "duration_ms": 180000, "artists": [{"name": "Irgendwer"}]}})
         if url.path == "/v1/me/player/queue" and method == "POST":
+            fault = STATE["queue_faults"].pop(0) if STATE["queue_faults"] else None
+            if fault == "404":
+                STATE["hold"] = 1
+                return self.send(404, {"error": {"status": 404, "reason": "NO_ACTIVE_DEVICE",
+                                                 "message": "Player command failed: No active device found"}})
             STATE["queued"].append(q.get("uri"))
+            if fault == "502x":
+                STATE["play_next"] = q.get("uri")
+                return self.send(502, {"error": {"status": 502, "message": "Bad gateway"}})
             return self.send(200)
         if url.path == "/v1/me/player/devices":
             return self.send(200, {"devices": [{"id": "dev1", "is_active": True, "name": "Wohnzimmer",
