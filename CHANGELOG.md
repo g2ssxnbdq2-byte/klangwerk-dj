@@ -42,6 +42,8 @@
   Stand grün ist. Schreibrechte hat allein der veröffentlichende Job. Fremde Actions sind auf
   Commits festgelegt, Dependabot schlägt wöchentlich Aktualisierungen vor.
 - `scripts/build-release.sh` legt die Lizenz in jedes Paket.
+- **Abhängigkeiten aktualisiert:** `rand` 0.10, `sha2` 0.11, `base64` 0.23, `directories` 6 sowie die
+  GitHub Actions (`checkout`, `setup-python`, `upload-artifact`, `download-artifact`).
 
 ### Neu
 

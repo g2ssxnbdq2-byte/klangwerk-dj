@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{RequestBuilder, StatusCode};
 use tracing::warn;
@@ -73,7 +73,7 @@ pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 
 pub fn backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
     let factor = 1u32 << attempt.saturating_sub(1).min(6);
-    let jitter: f64 = rand::thread_rng().gen_range(0.0..0.25);
+    let jitter: f64 = rand::rng().random_range(0.0..0.25);
     policy
         .base_delay
         .saturating_mul(factor)
