@@ -1,6 +1,10 @@
 # Änderungen
 
-## Unveröffentlicht
+## 0.1.1 – 2026-11-17
+
+Härtung nach einem Code-Check, aktualisierte Abhängigkeiten. Wer `SPOTIFY_API_BASE`,
+`SPOTIFY_ACCOUNTS_BASE` oder `ANTHROPIC_BASE_URL` auf eine http-Adresse im Heimnetz gesetzt hat,
+muss auf https umstellen (siehe „Geändert“).
 
 ### Behoben
 
